@@ -1,0 +1,608 @@
+diff --git a/apps/wordcraft-web/index.html b/apps/wordcraft-web/index.html
+index ca6ad469..e1d3ad3f 100644
+--- a/apps/wordcraft-web/index.html
++++ b/apps/wordcraft-web/index.html
+@@ -7,11 +7,47 @@
+   <link data-trunk rel="icon" href="../../assets/app-icon/wordcraft.ico" />
+   <link data-trunk rel="rust" data-bin="wordcraft-web" data-wasm-opt="z" data-weak-refs />
+   <style>
+-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #e6e6e6; }
++    :root, [data-theme="dark"] {
++      --bg-base: #1f1f1f;
++      --bg-panel: #292929;
++      --text-main: #eeeeee;
++      --text-muted: #b0b0b0;
++      --accent: #3b5bdb;
++      --border: #3a3a3a;
++      --aurora-gradient: linear-gradient(135deg, #4facfe 0%, #9b72cb 35%, #d96570 70%, #f3a183 100%);
++      --aurora-subtle-glow: linear-gradient(135deg, rgba(79, 172, 254, 0.15), rgba(155, 114, 203, 0.15), rgba(217, 101, 112, 0.15));
++    }
++    [data-theme="light"] {
++      --bg-base: #f0f0f0;
++      --bg-panel: #ffffff;
++      --text-main: #242424;
++      --text-muted: #616161;
++      --accent: #3b5bdb;
++      --border: #e1e1e1;
++    }
++    [data-theme="aurora"] {
++      --bg-base: #0b0d14;
++      --bg-panel: #131622;
++      --text-main: #e4e6eb;
++      --text-muted: #8b92a5;
++      --accent: #9b72cb;
++      --border: #272c40;
++      --aurora-gradient: linear-gradient(135deg, #4facfe 0%, #9b72cb 35%, #d96570 70%, #f3a183 100%);
++      --aurora-subtle-glow: linear-gradient(135deg, rgba(79, 172, 254, 0.15), rgba(155, 114, 203, 0.15), rgba(217, 101, 112, 0.15));
++    }
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg-base, #e6e6e6); }
+     #wordcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+     #wordcraft_loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+       color: #555; font: 14px system-ui, sans-serif; pointer-events: none; }
+   </style>
++  <script>
++    (function() {
++      try {
++        var theme = localStorage.getItem("artcraft_theme") || "dark";
++        document.documentElement.setAttribute("data-theme", theme);
++      } catch (e) {}
++    })();
++  </script>
+ </head>
+ <body>
+   <canvas id="wordcraft_canvas"></canvas>
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 76f53925..8a853af1 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -33,7 +33,9 @@ web-time = { workspace = true }
+ image = { workspace = true }
+ # The system's preferred interface languages (#8) and region (#838). Native: OS APIs; wasm:
+ # the browser's languages (`js`).
++rfd = { workspace = true }
+ sys-locale = { version = "0.3", features = ["js"] }
++ureq = { version = "3.5", features = ["rustls"] }
+ 
+ # Linux only, where winit reports no system theme: the desktop portal's light/dark answer (see
+ # `desktop_theme.rs`). Already in the tree, with these features, through egui's own accessibility
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index 36e40dc9..b7b0f4ec 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -81,6 +81,8 @@ impl WordApp {
+             alt_modifier_seen,
+         } = window_ui::WindowUi::new(session.document_id());
+         WordApp {
++            artcraft_drive: crate::artcraft_drive::ArtCraftDrive::new("WordCraft", "docx"),
++            artcraft_agent: crate::artcraft_agent::ArtCraftAgent::new(),
+             session,
+             ui: UiState {
+                 tab,
+@@ -94,6 +96,11 @@ impl WordApp {
+                 alt_chord_used,
+                 alt_key_down,
+                 alt_modifier_seen,
++                theme: match crate::artcraft_theme::AppTheme::load_global() {
++                    crate::artcraft_theme::AppTheme::Light => theme::Appearance::Light,
++                    crate::artcraft_theme::AppTheme::Aurora => theme::Appearance::Aurora,
++                    crate::artcraft_theme::AppTheme::Dark => theme::Appearance::Dark,
++                },
+                 ..UiState::default()
+             },
+             services,
+@@ -375,6 +382,8 @@ impl WordApp {
+         self.clear_stale_change_picture();
+         let _ = self.poll_file_dialog();
+         self.autosave_tick(now_ms());
++        self.poll_artcraft_agent();
++        self.artcraft_autosave_tick();
+         if self.autosaves() && self.session.dirty {
+             ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+         }
+@@ -448,3 +457,5 @@ impl WordApp {
+         self.flush_shot_and_synthetic(&ctx);
+     }
+ }
++
++include!("artcraft_mcp.rs");
+diff --git a/crates/ui-egui/src/app/frame.rs b/crates/ui-egui/src/app/frame.rs
+index 5541598d..4908a115 100644
+--- a/crates/ui-egui/src/app/frame.rs
++++ b/crates/ui-egui/src/app/frame.rs
+@@ -44,11 +44,28 @@ impl WordApp {
+         }
+     }
+ 
++    pub(super) fn artcraft_doc_summary(&mut self) -> String {
++        if !self.has_document() || self.ui.backstage {
++            return "Startbildschirm (Noch kein Dokument aktiv — wird bei Befehl automatisch erstellt)".to_string();
++        }
++        let title = self.title_stem();
++        let words = self.cached_word_count();
++        let body = self.session.doc.plain_text(wordcraft_doc::StoryRef::Body);
++        let excerpt: String = body.chars().take(1200).collect();
++        format!("Dokument: {title} ({words} Wörter)\nInhalt:\n{excerpt}")
++    }
++
+     /// Draw the File page, the empty-window chrome, or the normal document window.
+     pub(super) fn paint_window(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: theme::Tokens) {
+         let window = self.windows.shown();
+         let moved = |app: &WordApp| app.windows.shown() != window;
+         if self.ui.backstage {
++            chrome::title_bar(self, ui);
++            chrome::status_bar(self, ui);
++            let doc_text = self.artcraft_doc_summary();
++            let proj_dir = self.artcraft_drive.active_project_dir().to_string_lossy().to_string();
++            self.artcraft_agent.render_sidebar(ui, &doc_text, &proj_dir);
++            self.poll_artcraft_agent();
+             backstage::show(self, ui);
+         } else if !self.has_document() {
+             // No document open (#1129): the ribbon greyed out but for Help, and no page.
+@@ -78,6 +95,13 @@ impl WordApp {
+             if moved(self) {
+                 return;
+             }
++            let doc_text = self.artcraft_doc_summary();
++            let proj_dir = self.artcraft_drive.active_project_dir().to_string_lossy().to_string();
++            self.artcraft_agent.render_sidebar(ui, &doc_text, &proj_dir);
++            self.poll_artcraft_agent();
++            if moved(self) {
++                return;
++            }
+             let fill = if screen == chrome::Screen::Focus { chrome::FOCUS_CANVAS } else { t.canvas };
+             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(fill)).show(ui, |ui| {
+                 canvas::show(self, ui);
+diff --git a/crates/ui-egui/src/backstage.rs b/crates/ui-egui/src/backstage.rs
+index 6f6cfe5e..7319b4f4 100644
+--- a/crates/ui-egui/src/backstage.rs
++++ b/crates/ui-egui/src/backstage.rs
+@@ -580,6 +580,8 @@ fn personal_error_id() -> egui::Id {
+ /// stores an open failure in this page's temporary state.
+ fn open_list(app: &mut WordApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
++    // Prune missing paths immediately so deleted files disappear from the list.
++    app.ui.recent.retain(|p| std::path::Path::new(p).exists());
+     ui.label(egui::RichText::new(tl!("Recent")).font(semibold(16.0)));
+     ui.add_space(6.0);
+     let error = ui.ctx().data(|d| d.get_temp::<String>(open_error_id())).unwrap_or_default();
+diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
+index ac6fc94d..85a412a6 100644
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -390,6 +390,18 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
+                             }
+                             ui.add_space(8.0);
+                         }
++                        let drive_active = app.artcraft_drive.is_drive_detected();
++                        let proj_name = app.artcraft_drive.active_project_folder_name();
++                        let proj_dir = app.artcraft_drive.active_project_dir();
++                        crate::artcraft_theme::render_top_right_action_bar(
++                            ui,
++                            &mut app.artcraft_drive.auto_save_enabled,
++                            drive_active,
++                            &proj_name,
++                            &proj_dir,
++                            &mut app.artcraft_agent.is_open,
++                        );
++                        ui.add_space(8.0);
+                         search_box(app, ui, control_h);
+                         right_start = if rtl { ui.min_rect().max.x } else { ui.min_rect().min.x };
+                     });
+@@ -578,8 +590,25 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
+                 .stroke(Stroke::new(1.0, t.border)),
+         )
+         .show(ui, |ui| {
+-            // No document open (#1129): an empty status bar.
+-            if !app.has_document() {
++            if !app.has_document() || app.ui.backstage {
++                ui.horizontal_centered(|ui| {
++                    ui.label(egui::RichText::new("Ready — WordCraft").size(12.0).color(t.text_dim));
++                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                        let mut cur_theme = match app.ui.theme {
++                            crate::theme::Appearance::Light => crate::artcraft_theme::AppTheme::Light,
++                            crate::theme::Appearance::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++                            _ => crate::artcraft_theme::AppTheme::Dark,
++                        };
++                        if crate::artcraft_theme::render_theme_switcher_dropdown(ui, &mut cur_theme) {
++                            let new_app = match cur_theme {
++                                crate::artcraft_theme::AppTheme::Light => crate::theme::Appearance::Light,
++                                crate::artcraft_theme::AppTheme::Aurora => crate::theme::Appearance::Aurora,
++                                crate::artcraft_theme::AppTheme::Dark => crate::theme::Appearance::Dark,
++                            };
++                            let _ = app.run("ui.theme", json!({"value": new_app.code()}));
++                        }
++                    });
++                });
+                 return;
+             }
+             let rtl = crate::rtl::on();
+@@ -662,6 +691,20 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
+                     let msg_edge = ui.available_rect_before_wrap().max.x;
+                     let mut controls_left = if rtl { f32::NEG_INFINITY } else { f32::INFINITY };
+                     ui.with_layout(crate::rtl::far_side(ui, egui::Align::Center), |ui| {
++                        let mut cur_theme = match app.ui.theme {
++                            crate::theme::Appearance::Light => crate::artcraft_theme::AppTheme::Light,
++                            crate::theme::Appearance::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++                            _ => crate::artcraft_theme::AppTheme::Dark,
++                        };
++                        if crate::artcraft_theme::render_theme_switcher_dropdown(ui, &mut cur_theme) {
++                            let new_app = match cur_theme {
++                                crate::artcraft_theme::AppTheme::Light => crate::theme::Appearance::Light,
++                                crate::artcraft_theme::AppTheme::Aurora => crate::theme::Appearance::Aurora,
++                                crate::artcraft_theme::AppTheme::Dark => crate::theme::Appearance::Dark,
++                            };
++                            let _ = app.run("ui.theme", json!({"value": new_app.code()}));
++                        }
++                        ui.add_space(8.0);
+                         ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+                         let reading = app.session.view.read_mode;
+                         let z = (if reading { app.session.view.read_zoom } else { app.canvas.scale / crate::canvas::PX_PER_PT } * 100.0).round();
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index d21289ee..24cfd2d5 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -24,6 +24,9 @@ macro_rules! tl {
+ 
+ pub mod a11y;
+ pub mod a11y_pane;
++pub mod artcraft_agent;
++pub mod artcraft_theme;
++pub mod artcraft_drive;
+ pub mod async_saves;
+ pub mod autoscroll;
+ pub mod backstage;
+@@ -466,6 +469,8 @@ fn migrate_units(v: &mut Value) {
+ 
+ /// The application.
+ pub struct WordApp {
++    pub artcraft_drive: artcraft_drive::ArtCraftDrive,
++    pub artcraft_agent: artcraft_agent::ArtCraftAgent,
+     pub session: Session,
+     pub ui: UiState,
+     pub services: Services,
+diff --git a/crates/ui-egui/src/options.rs b/crates/ui-egui/src/options.rs
+index 2e6a0186..d57a7f6b 100644
+--- a/crates/ui-egui/src/options.rs
++++ b/crates/ui-egui/src/options.rs
+@@ -234,7 +234,6 @@ fn general(app: &mut WordApp, ui: &mut Ui) {
+     {
+         let _ = app.run("view.darkMode", json!({"value": dark_page}));
+     }
+-    ui.checkbox(&mut app.ui.show_discord, tl!("Show the community button in the title bar"));
+     default_app_button(app, ui);
+     ui.add_space(8.0);
+     section(ui, "Start-up");
+@@ -700,6 +699,12 @@ fn theme_picker(app: &mut WordApp, ui: &mut Ui) {
+             for a in Appearance::ALL {
+                 if ui.selectable_label(app.ui.theme == a, tl!(a.label())).clicked() {
+                     let _ = app.run("ui.theme", json!({"value": a.code()}));
++                    let global = match a {
++                        Appearance::Light => crate::artcraft_theme::AppTheme::Light,
++                        Appearance::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++                        _ => crate::artcraft_theme::AppTheme::Dark,
++                    };
++                    crate::artcraft_theme::AppTheme::save_global(global);
+                 }
+             }
+         });
+diff --git a/crates/ui-egui/src/panes/nav.rs b/crates/ui-egui/src/panes/nav.rs
+index 01c2e27b..ab44bfcc 100644
+--- a/crates/ui-egui/src/panes/nav.rs
++++ b/crates/ui-egui/src/panes/nav.rs
+@@ -30,14 +30,52 @@ pub(super) fn nav(app: &mut WordApp, ui: &mut Ui) {
+     }
+     ui.add_space(4.0);
+     ui.horizontal_wrapped(|ui| {
+-        for (k, l) in [("headings", "Headings"), ("pages", "Pages"), ("results", "Results")] {
+-            if ui.selectable_label(app.ui.nav_tab == k, tl!(l)).clicked() {
++        for (k, l) in [("headings", "Headings"), ("pages", "Pages"), ("results", "Results"), ("projects", "☁️ Projekte")] {
++            let label = if k == "projects" { "☁️ Projekte" } else { tl!(l) };
++            if ui.selectable_label(app.ui.nav_tab == k, label).clicked() {
+                 app.ui.nav_tab = k.into();
+             }
+         }
+     });
+     ui.separator();
+     egui::ScrollArea::vertical().show(ui, |ui| match app.ui.nav_tab.as_str() {
++        "projects" => {
++            ui.heading("☁️ Google Drive Projekte");
++            let drive_status = if app.artcraft_drive.is_drive_detected() {
++                format!("Speicherort: {}", app.artcraft_drive.app_suite_dir().display())
++            } else {
++                "Kein Google Drive gefunden (G: nicht verbunden)".to_string()
++            };
++            ui.label(egui::RichText::new(drive_status).small().weak());
++            ui.add_space(6.0);
++            if ui.button("➕ Neues Projekt erstellen").clicked() {
++                let target = app.artcraft_drive.set_or_init_project(None);
++                let _ = app.run("file.saveAs", json!({"path": target.to_string_lossy().to_string()}));
++            }
++            ui.separator();
++            let projects = app.artcraft_drive.list_projects();
++            if projects.is_empty() {
++                ui.label(egui::RichText::new("Noch keine Projekte vorhanden.").italics().weak());
++            } else {
++                for p in projects {
++                    let is_active = p.folder_name == app.artcraft_drive.active_project_folder_name();
++                    let label = if is_active {
++                        format!("📁 {} (Aktiv)", p.name)
++                    } else {
++                        format!("📁 {}", p.name)
++                    };
++                    if ui.selectable_label(is_active, label).clicked() {
++                        let _ = app.artcraft_drive.switch_to_project(&p.folder_name);
++                        if let Some(file_path) = p.primary_file {
++                            let _ = app.run("file.open", json!({"path": file_path.to_string_lossy().to_string()}));
++                        }
++                    }
++                    if !p.modified_str.is_empty() && p.modified_str != "-" {
++                        ui.label(egui::RichText::new(format!("  Geändert: {}", p.modified_str)).small().weak());
++                    }
++                }
++            }
++        }
+         "pages" => {
+             let l = app.session.layout();
+             for (i, p) in l.pages.iter().enumerate() {
+diff --git a/crates/ui-egui/src/theme.rs b/crates/ui-egui/src/theme.rs
+index ee9347c7..ac297f5f 100644
+--- a/crates/ui-egui/src/theme.rs
++++ b/crates/ui-egui/src/theme.rs
+@@ -16,19 +16,21 @@ pub const APP_INK: Color32 = Color32::from_rgb(0x2B, 0x47, 0xB5);
+ pub enum Appearance {
+     Light,
+     Dark,
++    Aurora,
+     #[default]
+     System,
+ }
+ 
+ impl Appearance {
+     /// In menu order.
+-    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
++    pub const ALL: [Appearance; 4] = [Appearance::System, Appearance::Light, Appearance::Dark, Appearance::Aurora];
+ 
+     /// The value used in `ui.json` and by the `ui.theme` command.
+     pub fn code(self) -> &'static str {
+         match self {
+             Appearance::Light => "light",
+             Appearance::Dark => "dark",
++            Appearance::Aurora => "aurora",
+             Appearance::System => "system",
+         }
+     }
+@@ -42,6 +44,7 @@ impl Appearance {
+         match self {
+             Appearance::Light => "Light",
+             Appearance::Dark => "Dark",
++            Appearance::Aurora => "Aurora",
+             Appearance::System => "Use system setting",
+         }
+     }
+@@ -52,6 +55,7 @@ impl Appearance {
+         match self {
+             Appearance::Light => false,
+             Appearance::Dark => true,
++            Appearance::Aurora => true,
+             Appearance::System => system == Some(egui::Theme::Dark),
+         }
+     }
+@@ -61,6 +65,7 @@ impl Appearance {
+         match self {
+             Appearance::Light => egui::ThemePreference::Light,
+             Appearance::Dark => egui::ThemePreference::Dark,
++            Appearance::Aurora => egui::ThemePreference::Dark,
+             Appearance::System => egui::ThemePreference::System,
+         }
+     }
+@@ -369,33 +374,31 @@ impl Tokens {
+     pub fn dark() -> Self {
+         Tokens {
+             dark: true,
+-            title_bar: Color32::from_rgb(0x1F, 0x1F, 0x1F),
+-            ribbon: Color32::from_rgb(0x29, 0x29, 0x29),
+-            tab_strip: Color32::from_rgb(0x1F, 0x1F, 0x1F),
+-            canvas: Color32::from_rgb(0x14, 0x14, 0x14),
+-            panel: Color32::from_rgb(0x26, 0x26, 0x26),
+-            border: Color32::from_rgb(0x3A, 0x3A, 0x3A),
+-            border_strong: Color32::from_rgb(0x55, 0x55, 0x55),
+-            text: Color32::from_rgb(0xEE, 0xEE, 0xEE),
+-            text_dim: Color32::from_rgb(0xC8, 0xC8, 0xC8),
+-            text_disabled: Color32::from_rgb(0x6A, 0x6A, 0x6A),
+-            icon: Color32::from_rgb(0xDD, 0xDD, 0xDD),
+-            hover: Color32::from_rgb(0x3D, 0x3D, 0x3D),
+-            pressed: Color32::from_rgb(0x4A, 0x4A, 0x4A),
+-            checked: Color32::from_rgb(0x2E, 0x3A, 0x66),
++            title_bar: Color32::from_rgb(0x12, 0x12, 0x14),
++            ribbon: Color32::from_rgb(0x18, 0x18, 0x1B),
++            tab_strip: Color32::from_rgb(0x12, 0x12, 0x14),
++            canvas: Color32::from_rgb(0x12, 0x12, 0x14),
++            panel: Color32::from_rgb(0x18, 0x18, 0x1B),
++            border: Color32::from_rgb(0x27, 0x27, 0x2A),
++            border_strong: Color32::from_rgb(0x3F, 0x3F, 0x46),
++            text: Color32::from_rgb(0xED, 0xED, 0xED),
++            text_dim: Color32::from_rgb(0xA1, 0xA1, 0xAA),
++            text_disabled: Color32::from_rgb(0x71, 0x71, 0x7A),
++            icon: Color32::from_rgb(0xA1, 0xA1, 0xAA),
++            hover: Color32::from_rgb(0x27, 0x27, 0x2A),
++            pressed: Color32::from_rgb(0x32, 0x32, 0x38),
++            checked: Color32::from_rgb(0x28, 0x28, 0x30),
+             accent: Color32::from_rgb(0x7A, 0x93, 0xF0),
+-            nav: Color32::from_rgb(0x27, 0x31, 0x5C),
++            nav: Color32::from_rgb(0x20, 0x20, 0x26),
+             accent_text: Color32::from_rgb(0x9C, 0xB0, 0xF5),
+-            // Dark text on the light dark-theme accent: white on #7a93f0 is only 2.9:1 (#655).
+             on_accent: Color32::from_rgb(0x11, 0x16, 0x2E),
+-            input: Color32::from_rgb(0x1E, 0x1E, 0x1E),
+-            input_border: Color32::from_rgb(0x7A, 0x7A, 0x7A),
+-            group_label: Color32::from_rgb(0xA0, 0xA0, 0xA0),
+-            // The text area is lighter than the margins, as in the light theme (#1148).
+-            ruler: Color32::from_rgb(0x45, 0x45, 0x45),
+-            ruler_margin: Color32::from_rgb(0x2E, 0x2E, 0x2E),
+-            ruler_tick: Color32::from_rgb(0xB4, 0xB4, 0xB4),
+-            status_bar: Color32::from_rgb(0x1F, 0x1F, 0x1F),
++            input: Color32::from_rgb(0x20, 0x20, 0x24),
++            input_border: Color32::from_rgb(0x3F, 0x3F, 0x46),
++            group_label: Color32::from_rgb(0x8A, 0x8A, 0x90),
++            ruler: Color32::from_rgb(0x20, 0x20, 0x24),
++            ruler_margin: Color32::from_rgb(0x18, 0x18, 0x1B),
++            ruler_tick: Color32::from_rgb(0x71, 0x71, 0x7A),
++            status_bar: Color32::from_rgb(0x12, 0x12, 0x14),
+             selection: Color32::from_rgba_unmultiplied(0x7A, 0x93, 0xF0, 0x55),
+             find_highlight: Color32::from_rgba_unmultiplied(0xC8, 0xA8, 0x00, 0x70),
+             page_shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 0x60),
+@@ -404,10 +407,10 @@ impl Tokens {
+             guide: Color32::from_rgb(0xE0, 0x4C, 0xB0),
+             equation_box: Color32::from_rgb(0x6E, 0x9B, 0xE6),
+             crop_handle: Color32::BLACK,
+-            crop_dim: Color32::from_rgba_unmultiplied(0x30, 0x30, 0x30, 0xE0),
+-            balloon: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+-            markup_area: Color32::from_rgb(0x1B, 0x1B, 0x1B),
+-            markup_edge: Color32::from_rgb(0x3A, 0x3A, 0x3A),
++            crop_dim: Color32::from_rgba_unmultiplied(0x12, 0x12, 0x14, 0xE0),
++            balloon: Color32::from_rgb(0x18, 0x18, 0x1B),
++            markup_area: Color32::from_rgb(0x12, 0x12, 0x14),
++            markup_edge: Color32::from_rgb(0x27, 0x27, 0x2A),
+             resolved_text: Color32::from_rgb(0x5B, 0xC0, 0x8A),
+             author_colors: [
+                 Color32::from_rgb(0x7F, 0xA8, 0xF2),
+@@ -423,19 +426,90 @@ impl Tokens {
+                 Color32::from_rgb(0x8E, 0x44, 0xAD),
+                 Color32::from_rgb(0xE0, 0x7B, 0x1F),
+             ],
+-            menu: Color32::from_rgb(0x2B, 0x2B, 0x2B),
++            menu: Color32::from_rgb(0x20, 0x20, 0x24),
+             blue: Color32::from_rgb(0x6C, 0x9B, 0xEA),
+             red: Color32::from_rgb(0xEE, 0x6A, 0x6A),
+             green: Color32::from_rgb(0x5B, 0xC0, 0x8A),
+             orange: Color32::from_rgb(0xF0, 0xA0, 0x50),
+-            // A little lighter than the light theme's red, so it reads against the dark window.
++            close_hover: Color32::from_rgb(0xD6, 0x3C, 0x2C),
++            close_pressed: Color32::from_rgb(0xB3, 0x30, 0x23),
++            on_close: Color32::WHITE,
++        }
++    }
++    pub fn aurora() -> Self {
++        Tokens {
++            dark: true,
++            title_bar: Color32::from_rgb(0x09, 0x0B, 0x14),
++            ribbon: Color32::from_rgb(0x0F, 0x13, 0x22),
++            tab_strip: Color32::from_rgb(0x09, 0x0B, 0x14),
++            canvas: Color32::from_rgb(0x09, 0x0B, 0x14),
++            panel: Color32::from_rgb(0x0F, 0x13, 0x22),
++            border: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++            border_strong: Color32::from_rgba_unmultiplied(168, 85, 247, 90),
++            text: Color32::from_rgb(0xF1, 0xF3, 0xF9),
++            text_dim: Color32::from_rgb(0x94, 0xA3, 0xB8),
++            text_disabled: Color32::from_rgb(0x64, 0x74, 0x8B),
++            icon: Color32::from_rgb(0x94, 0xA3, 0xB8),
++            hover: Color32::from_rgb(0x1E, 0x24, 0x40),
++            pressed: Color32::from_rgb(0x28, 0x30, 0x56),
++            checked: Color32::from_rgba_unmultiplied(168, 85, 247, 56),
++            accent: Color32::from_rgb(0xA8, 0x55, 0xF7),
++            nav: Color32::from_rgb(0x16, 0x1B, 0x30),
++            accent_text: Color32::from_rgb(0xC0, 0x84, 0xFC),
++            on_accent: Color32::WHITE,
++            input: Color32::from_rgb(0x16, 0x1B, 0x30),
++            input_border: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++            group_label: Color32::from_rgb(0x94, 0xA3, 0xB8),
++            ruler: Color32::from_rgb(0x16, 0x1B, 0x30),
++            ruler_margin: Color32::from_rgb(0x0F, 0x13, 0x22),
++            ruler_tick: Color32::from_rgb(0x94, 0xA3, 0xB8),
++            status_bar: Color32::from_rgb(0x09, 0x0B, 0x14),
++            selection: Color32::from_rgba_unmultiplied(168, 85, 247, 70),
++            find_highlight: Color32::from_rgba_unmultiplied(0xF3, 0xA1, 0x83, 0x70),
++            page_shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 0x80),
++            handle: Color32::WHITE,
++            handle_shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 0x60),
++            guide: Color32::from_rgb(0xEC, 0x48, 0x99),
++            equation_box: Color32::from_rgb(0x38, 0xBD, 0xF8),
++            crop_handle: Color32::BLACK,
++            crop_dim: Color32::from_rgba_unmultiplied(0x09, 0x0B, 0x14, 0xE0),
++            balloon: Color32::from_rgb(0x0F, 0x13, 0x22),
++            markup_area: Color32::from_rgb(0x09, 0x0B, 0x14),
++            markup_edge: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++            resolved_text: Color32::from_rgb(0x5B, 0xC0, 0x8A),
++            author_colors: [
++                Color32::from_rgb(0x38, 0xBD, 0xF8),
++                Color32::from_rgb(0xEC, 0x48, 0x99),
++                Color32::from_rgb(0x5B, 0xC0, 0x8A),
++                Color32::from_rgb(0xA8, 0x55, 0xF7),
++                Color32::from_rgb(0xFB, 0x92, 0x3C),
++            ],
++            leader_colors: [
++                Color32::from_rgb(0x38, 0xBD, 0xF8),
++                Color32::from_rgb(0xEC, 0x48, 0x99),
++                Color32::from_rgb(0x5B, 0xC0, 0x8A),
++                Color32::from_rgb(0xA8, 0x55, 0xF7),
++                Color32::from_rgb(0xFB, 0x92, 0x3C),
++            ],
++            menu: Color32::from_rgb(0x16, 0x1B, 0x30),
++            blue: Color32::from_rgb(0x38, 0xBD, 0xF8),
++            red: Color32::from_rgb(0xEF, 0x44, 0x44),
++            green: Color32::from_rgb(0x22, 0xC5, 0x5E),
++            orange: Color32::from_rgb(0xFB, 0x92, 0x3C),
+             close_hover: Color32::from_rgb(0xD6, 0x3C, 0x2C),
+             close_pressed: Color32::from_rgb(0xB3, 0x30, 0x23),
+             on_close: Color32::WHITE,
+         }
+     }
+     pub fn get(ctx: &egui::Context) -> Tokens {
+-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
++        let is_aurora = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("is_aurora")).unwrap_or(false));
++        if is_aurora {
++            Tokens::aurora()
++        } else if ctx.global_style().visuals.dark_mode {
++            Tokens::dark()
++        } else {
++            Tokens::light()
++        }
+     }
+ }
+ 
+@@ -641,7 +715,15 @@ pub fn font_definitions_language_arabic(
+         data.index = f.index;
+         add_cjk(&mut fonts, format!("system {}", f.family), data);
+     }
+-    // Symbols and emoji fall back to egui's defaults (kept in the families).
++    #[cfg(target_os = "windows")]
++    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
++        fonts.font_data.insert("seguiemj".into(), Arc::new(FontData::from_owned(bytes)));
++        for fam in [FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("medium".into()), FontFamily::Name("semibold".into())] {
++            if let Some(v) = fonts.families.get_mut(&fam) {
++                v.push("seguiemj".into());
++            }
++        }
++    }
+     fonts
+ }
+ 
+@@ -820,8 +902,14 @@ fn tracked_job(text: &str, font: &FontId, tracking: f32, color: Color32) -> egui
+ /// Setting a concrete theme for `System` would pin the native window too, and macOS then stops
+ /// reporting appearance changes (#311).
+ pub fn apply(ctx: &egui::Context, appearance: Appearance) {
++    let is_aurora = appearance == Appearance::Aurora;
++    ctx.data_mut(|d| d.insert_temp(egui::Id::new("is_aurora"), is_aurora));
++    if is_aurora {
++        ctx.set_visuals_of(egui::Theme::Dark, visuals(&Tokens::aurora()));
++    } else {
++        ctx.set_visuals_of(egui::Theme::Dark, visuals(&Tokens::dark()));
++    }
+     ctx.set_visuals_of(egui::Theme::Light, visuals(&Tokens::light()));
+-    ctx.set_visuals_of(egui::Theme::Dark, visuals(&Tokens::dark()));
+     ctx.all_styles_mut(|s| {
+         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+         s.spacing.button_padding = egui::vec2(8.0, 3.0);
+diff --git a/crates/ui-egui/src/window_ui.rs b/crates/ui-egui/src/window_ui.rs
+index 8e697768..7ee3e80c 100644
+--- a/crates/ui-egui/src/window_ui.rs
++++ b/crates/ui-egui/src/window_ui.rs
+@@ -248,6 +248,8 @@ impl WordApp {
+             file_browser,
+             info_editing,
+             shown_document,
++            artcraft_drive: _,
++            artcraft_agent: _,
+         } = self;
+         let UiState {
+             // App-wide: preferences, recent lists, and the settings the session owns while

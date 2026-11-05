@@ -1,0 +1,30 @@
+# Rust / Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# User-specific local runtime configs & API keys (NEVER commit!)
+shared_custom_models.json
+shared-ai-config.json
+cloud-config.json
+artcraft_theme.json
+.env
+.env.*
+*.key
+*.pem
+.DS_Store
+Thumbs.db
+
+# --- ArtCraft clean import: required ignore rules ---
+dist/
+engines/
+*.pfx
+*.zip
+*.exe
+*.dll
+

@@ -1,0 +1,5 @@
+{
+  "provider": "Google Drive",
+  "sync_path": "C:/Users/<YourUsername>/Documents/CraftSuite_Sync",
+  "auto_save": true
+}

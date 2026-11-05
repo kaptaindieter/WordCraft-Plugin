@@ -1,0 +1,27 @@
+{
+  "plugin_name": "WordCraft-Plugin",
+  "target_application": "WordCraft",
+  "upstream_repository": "https://github.com/storytold/wordcraft",
+  "tested_vanilla_commit": "ae5c65b9dd11faf359ce039a2a487e57e3d824a2",
+  "tested_vanilla_commit_subject": "Paste: charge copied text box stories for the formatting they clone (#5379)",
+  "tested_vanilla_commit_date": "2026-11-03 09:05:14 -0500",
+  "standalone_plugin_modules": [
+    "crates/ui-egui/src/artcraft_agent.rs",
+    "crates/ui-egui/src/artcraft_mcp.rs",
+    "crates/ui-egui/src/artcraft_drive.rs",
+    "crates/ui-egui/src/artcraft_theme.rs"
+  ],
+  "hooked_vanilla_files": [
+    "apps/wordcraft-web/index.html",
+    "crates/ui-egui/Cargo.toml",
+    "crates/ui-egui/src/app.rs",
+    "crates/ui-egui/src/app/frame.rs",
+    "crates/ui-egui/src/backstage.rs",
+    "crates/ui-egui/src/chrome.rs",
+    "crates/ui-egui/src/lib.rs",
+    "crates/ui-egui/src/options.rs",
+    "crates/ui-egui/src/panes/nav.rs",
+    "crates/ui-egui/src/theme.rs",
+    "crates/ui-egui/src/window_ui.rs"
+  ]
+}

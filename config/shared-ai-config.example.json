@@ -1,0 +1,13 @@
+{
+  "bots": [
+    {
+      "id": "custom_gemini",
+      "name": "Google Gemini 2.5 Flash",
+      "api_model_id": "gemini-2.5-flash",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api_key": "YOUR_API_KEY_HERE",
+      "used_tokens": 0,
+      "max_quota_tokens": 1000000
+    }
+  ]
+}
