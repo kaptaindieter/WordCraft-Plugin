@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const GEMINI_OPENAI_CHAT_COMPLETIONS: &str = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 // Gemini OpenAI-compat endpoints require an Authorization Bearer token (Gemini API key).
@@ -2388,7 +2388,7 @@ fn normalize_endpoint(ep: &str) -> String {
     }
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
-    } else if trimmed == "https://generativelanguage.googleapis.com/v1beta/openai" {
+    } else if trimmed == GEMINI_OPENAI_BASE_URL {
         GEMINI_OPENAI_CHAT_COMPLETIONS.to_string()
     } else if trimmed.ends_with("/v1beta/openai") {
         // Gemini's OpenAI-compat docs specify a trailing slash base URL.
@@ -2852,10 +2852,10 @@ fn worker_loop(
                     }
 
                     let agent = build_http_agent();
-                    let body_str = serde_json::to_string(&body).unwrap_or_default();
+                    let mut request_body_str = serde_json::to_string(&body).unwrap_or_default();
                     let req = apply_auth_headers(agent.post(&endpoint).header("Content-Type", "application/json"), &bot.api_key);
 
-                    let mut response_res = req.send(&body_str);
+                    let mut response_res = req.send(&request_body_str);
 
                     // Fallback: if an endpoint rejects `tools` parameter, retry without `tools`
                     if response_res.is_err() && body.get("tools").is_some() {
@@ -2864,9 +2864,9 @@ fn worker_loop(
                             "messages": api_messages,
                             "temperature": 0.5,
                         });
-                        let fb_str = serde_json::to_string(&fallback_body).unwrap_or_default();
+                        request_body_str = serde_json::to_string(&fallback_body).unwrap_or_default();
                         let fb_req = apply_auth_headers(agent.post(&endpoint).header("Content-Type", "application/json"), &bot.api_key);
-                        response_res = fb_req.send(&fb_str);
+                        response_res = fb_req.send(&request_body_str);
                     }
 
                     let response_val = match response_res {
@@ -2884,7 +2884,7 @@ fn worker_loop(
                                 .build();
                             let agent = ureq::Agent::new_with_config(cfg);
                             let req = apply_auth_headers(agent.post(&endpoint).header("Content-Type", "application/json"), &bot.api_key);
-                            match req.send(&body_str) {
+                            match req.send(&request_body_str) {
                                 Ok(resp) => {
                                     let body_txt = read_error_body(resp);
                                     let msg = extract_error_message_from_body(&body_txt).unwrap_or(body_txt);
