@@ -11,6 +11,47 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const GEMINI_OPENAI_CHAT_COMPLETIONS: &str = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+
+// Gemini OpenAI-compat endpoints require an Authorization Bearer token (Gemini API key).
+// See: https://aistudio.google.com/docs/openai
+fn apply_auth_headers(mut req: ureq::RequestBuilder<ureq::typestate::WithBody>, api_key: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return req;
+    }
+    req = req.header("Authorization", &format!("Bearer {}", key));
+    req
+}
+
+fn read_error_body(mut resp: ureq::http::Response<ureq::Body>) -> String {
+    let mut buf = String::new();
+    let _ = resp.body_mut().as_reader().read_to_string(&mut buf);
+    buf
+}
+
+fn extract_error_message_from_body(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    if let Some(msg) = parsed.get("error").and_then(|e| e.get("message")).and_then(Value::as_str) {
+        return Some(msg.to_string());
+    }
+    if let Some(first) = parsed.as_array().and_then(|a| a.first()) {
+        if let Some(msg) = first.get("error").and_then(|e| e.get("message")).and_then(Value::as_str) {
+            return Some(msg.to_string());
+        }
+    }
+    None
+}
+
+fn build_http_agent() -> ureq::Agent {
+    // Configure a sane global timeout so the UI does not hang indefinitely.
+    let cfg = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build();
+    ureq::Agent::new_with_config(cfg)
+}
+
 pub const APP_NAME: &str = "WordCraft";
 pub const APP_ROLE: &str = "Writing Assistant";
 pub const PANEL_ID: &str = "wordcraft_ai_sidebar";
@@ -261,7 +302,7 @@ impl ArtCraftAgent {
             new_bot_endpoint: String::new(),
             new_bot_key: String::new(),
             preset_hint_endpoint: "https://api.deepseek.com/chat/completions".to_string(),
-            preset_hint_model: "e.g. deepseek-chat, gpt-4o, gemini-2.5-flash, llama3.1".to_string(),
+            preset_hint_model: "e.g. deepseek-chat, gpt-4o, gemini-3.5-flash-lite, llama3.1".to_string(),
             show_api_key_plain: false,
             test_connection_status: None,
             copied_feedback: None,
@@ -1639,7 +1680,7 @@ impl ArtCraftAgent {
 
                 let presets: [(&str, &str, &str, &str); 8] = [
                     ("OpenAI GPT", "gpt", "e.g. https://api.openai.com/v1/chat/completions", "e.g. gpt-4o"),
-                    ("Gemini", "gemini", "e.g. https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "e.g. gemini-2.5-flash"),
+                    ("Gemini", "gemini", "e.g. https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "e.g. gemini-3.5-flash-lite"),
                     ("DeepSeek", "deepseek", "e.g. https://api.deepseek.com/chat/completions", "e.g. deepseek-chat"),
                     ("Mistral", "mistral", "e.g. https://api.mistral.ai/v1/chat/completions", "e.g. mistral-large-latest"),
                     ("Qwen", "qwen", "e.g. https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", "e.g. qwen-plus"),
@@ -2347,7 +2388,12 @@ fn normalize_endpoint(ep: &str) -> String {
     }
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
-    } else if trimmed.ends_with("/v1") || trimmed.ends_with("/v1beta/openai") {
+    } else if trimmed == "https://generativelanguage.googleapis.com/v1beta/openai" {
+        GEMINI_OPENAI_CHAT_COMPLETIONS.to_string()
+    } else if trimmed.ends_with("/v1beta/openai") {
+        // Gemini's OpenAI-compat docs specify a trailing slash base URL.
+        format!("{trimmed}/chat/completions")
+    } else if trimmed.ends_with("/v1") {
         format!("{trimmed}/chat/completions")
     } else {
         trimmed.to_string()
@@ -2361,25 +2407,40 @@ fn test_api_endpoint(endpoint: &str, api_key: &str, model_id: &str) -> (bool, St
         "messages": [{"role": "user", "content": "Ping"}],
         "max_tokens": 5
     });
-    let agent = ureq::Agent::new_with_defaults();
-    let mut req = agent.post(&url).header("Content-Type", "application/json");
-    if !api_key.trim().is_empty() {
-        req = req.header("Authorization", &format!("Bearer {}", api_key.trim()));
-    }
+    let agent = build_http_agent();
+    let req = apply_auth_headers(agent.post(&url).header("Content-Type", "application/json"), api_key);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     match req.send(&body_str) {
         Ok(mut resp) => {
             let mut buf = String::new();
             let _ = resp.body_mut().as_reader().read_to_string(&mut buf);
+            if let Some(err) = extract_error_message_from_body(&buf) {
+                return (false, format!("❌ API Error: {err}"));
+            }
             if let Ok(v) = serde_json::from_str::<Value>(&buf) {
-                if let Some(err) = v.get("error").and_then(|e| e.get("message")).and_then(Value::as_str) {
-                    return (false, format!("❌ API Error: {err}"));
-                }
                 if v.get("choices").is_some() {
                     return (true, format!("✅ Connection successful ({model_id})!"));
                 }
             }
             (true, "✅ Endpoint reachable!".to_string())
+        }
+        Err(ureq::Error::StatusCode(code)) => {
+            // ureq hides the response body on StatusCode errors when http_status_as_error=true.
+            // Retry with http_status_as_error=false to surface the provider error message.
+            let cfg = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(60)))
+                .http_status_as_error(false)
+                .build();
+            let agent = ureq::Agent::new_with_config(cfg);
+            let req = apply_auth_headers(agent.post(&url).header("Content-Type", "application/json"), api_key);
+            match req.send(&body_str) {
+                Ok(resp) => {
+                    let body_txt = read_error_body(resp);
+                    let msg = extract_error_message_from_body(&body_txt).unwrap_or(body_txt);
+                    (false, format!("❌ HTTP {code}: {msg}"))
+                }
+                Err(e) => (false, format!("❌ Connection failed: {e}")),
+            }
         }
         Err(e) => (false, format!("❌ Connection failed: {e}")),
     }
@@ -2790,12 +2851,9 @@ fn worker_loop(
                         }
                     }
 
-                    let agent = ureq::Agent::new_with_defaults();
+                    let agent = build_http_agent();
                     let body_str = serde_json::to_string(&body).unwrap_or_default();
-                    let mut req = agent.post(&endpoint).header("Content-Type", "application/json");
-                    if !bot.api_key.trim().is_empty() {
-                        req = req.header("Authorization", &format!("Bearer {}", bot.api_key.trim()));
-                    }
+                    let req = apply_auth_headers(agent.post(&endpoint).header("Content-Type", "application/json"), &bot.api_key);
 
                     let mut response_res = req.send(&body_str);
 
@@ -2807,10 +2865,7 @@ fn worker_loop(
                             "temperature": 0.5,
                         });
                         let fb_str = serde_json::to_string(&fallback_body).unwrap_or_default();
-                        let mut fb_req = agent.post(&endpoint).header("Content-Type", "application/json");
-                        if !bot.api_key.trim().is_empty() {
-                            fb_req = fb_req.header("Authorization", &format!("Bearer {}", bot.api_key.trim()));
-                        }
+                        let fb_req = apply_auth_headers(agent.post(&endpoint).header("Content-Type", "application/json"), &bot.api_key);
                         response_res = fb_req.send(&fb_str);
                     }
 
@@ -2819,6 +2874,30 @@ fn worker_loop(
                             let mut buf = String::new();
                             let _ = r.body_mut().as_reader().read_to_string(&mut buf);
                             serde_json::from_str::<Value>(&buf)
+                        }
+                        Err(ureq::Error::StatusCode(code)) => {
+                            // ureq hides the response body on StatusCode errors when http_status_as_error=true.
+                            // Retry with http_status_as_error=false to surface the provider error message.
+                            let cfg = ureq::Agent::config_builder()
+                                .timeout_global(Some(Duration::from_secs(60)))
+                                .http_status_as_error(false)
+                                .build();
+                            let agent = ureq::Agent::new_with_config(cfg);
+                            let req = apply_auth_headers(agent.post(&endpoint).header("Content-Type", "application/json"), &bot.api_key);
+                            match req.send(&body_str) {
+                                Ok(resp) => {
+                                    let body_txt = read_error_body(resp);
+                                    let msg = extract_error_message_from_body(&body_txt).unwrap_or(body_txt);
+                                    fatal_error = true;
+                                    let _ = event_tx.send(AgentEvent::Error(format!("HTTP {code}: {msg}")));
+                                    break;
+                                }
+                                Err(e) => {
+                                    fatal_error = true;
+                                    let _ = event_tx.send(AgentEvent::Error(format!("Network error: {e}")));
+                                    break;
+                                }
+                            }
                         }
                         Err(e) => {
                             fatal_error = true;
